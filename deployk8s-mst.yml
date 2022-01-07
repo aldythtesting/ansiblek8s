@@ -1,0 +1,210 @@
+# Deployment K8S Master Ansible 
+---
+- name: "Deployment K8s - MASTER"
+  hosts: localhost
+  connection: local
+  tasks:
+  # Set Kernel Parameter for IP Forwarding
+  - name: "Set Parameter Kernel"
+    shell:
+      cmd: |
+        tee /etc/sysctl.d/kubernetes.conf << EOF
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.bridge.bridge-nf-call-iptables = 1
+        net.ipv4.ip_forward = 1
+        EOF
+    register: "output"
+  - debug: var=output.stdout_lines
+
+  - name: "Reload systemctl"
+    shell: "sysctl --system"
+    register: "output"
+  - debug: var=output.stdout_lines
+  
+  # Set firewalld for allow needed ports, if dont need firewalld use systemctl stop firewalld instead and systemctl disable firewalld
+  - name: "Set Firewalld"
+    shell: |
+      firewall-cmd --permanent --add-port=6443/tcp
+      firewall-cmd --permanent --add-port=2379-2380/tcp
+      firewall-cmd --permanent --add-port=10250/tcp
+      firewall-cmd --permanent --add-port=10251/tcp
+      firewall-cmd --permanent --add-port=10252/tcp
+      firewall-cmd --permanent --add-port=10255/tcp
+      firewall-cmd --permanent --add-port=179/tcp
+      firewall-cmd --permanent --add-port=4789/udp
+      firewall-cmd --permanent --add-port=5473/tcp
+    register: "shell_output"
+  - debug: var=shell_output
+
+  - name: "Reload Firewalld"
+    shell: |
+      firewall-cmd --reload
+    register: "output"
+  - debug: var=output.stdout_lines
+
+ # Set Permissive SELINUX
+  - name: "Set SELINUX"
+    shell: | 
+      sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config 
+      sed -i '/swap/d' /etc/fstab
+      swapoff -a
+    register: "output"
+  - debug: var=output.stdout_lines
+
+# Load Kernel Module for netfilter
+  - name: "Modprobe Module"
+    shell: |
+      modprobe overlay 
+      modprobe br_netfilter
+    register: "output"
+  - debug: var=output.stdout_lines
+
+ # Install YUM Utilis for repo configuration
+  - name: "Install YUM Utils"
+    shell: |
+      yum install -y yum-utils device-mapper-persistent-data lvm2 git
+      yum-config-manager --add-repo  https://download.docker.com/linux/centos/docker-ce.repo
+      yum repolist all
+    register: "output"
+  - debug: var=output.stdout_lines
+
+ # Install docker container runtime, this is can use containerd,cri-o or podman
+
+  - name: "Install Docker"
+    shell: |
+      yum install -y containerd.io docker-ce docker-ce-cli --nobest --allowerasing
+    register: "output"
+  - debug: var=output.stdout_lines
+
+# Create custom daemon docker, use systemd instead of cgroupfs
+  - name: "Create file docker daemon"
+    shell: |
+      mkdir -p /etc/docker
+      touch /etc/docker/daemon.json
+    register: "output"
+  - debug: var=output.stdout_lines
+
+  - name: "Edit Docker JSON Daemon"
+    shell:
+      cmd: |
+        tee /etc/docker/daemon.json <<EOF 
+        {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "100m" },
+        "storage-driver": "overlay2"
+        } 
+        EOF
+    register: "output"
+  - debug: var=output.stdout_lines
+
+# Start docker daemon and test docker can run container
+  - name: "Enable and start Docker Daemon"
+    shell: |
+      systemctl enable docker
+      systemctl restart docker
+    register: "output"
+  - debug: var=output.stdout_lines
+
+  - name: "Test Hello World Docker"
+    shell: |
+      docker run hello-world
+    register: "shell_output"
+  - debug: var=shell_output
+
+# Create K8s Repository
+  - name: "Create K8s repo"
+    shell: |
+      touch /etc/yum.repos.d/kubernetes.repo
+    register: "shell_output"
+  - debug: var=shell_output
+
+  - name: "Edit K8s repo"
+    shell:
+      cmd: |
+        tee /etc/yum.repos.d/kubernetes.repo <<EOF
+        [kubernetes]
+        name=Kubernetes
+        baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+        enabled=1
+        gpgcheck=1
+        repo_gpgcheck=1
+        gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+        EOF
+    register: "output"
+  - debug: var=output.stdout_lines
+
+# Install kubeadm bootstrap components
+  - name: "Install Kubeadm"
+    shell: |
+      yum repolist all
+      yum -y install kubeadm kubelet kubectl
+    register: "shell_output"
+  - debug: var=shell_output
+
+# Enable kubelet service
+  - name: "Enable Kubeadm"
+    shell: |
+      systemctl enable kubelet
+    register: "output"
+  - debug: var=output.stdout_lines
+
+# K8S Initialization
+# Set the POD CIDR (for internal pod to pod IP Address)
+# Set the SVC CIDR (service cluster IP Address for application / service access)
+# Set the Advertise IP Address (master IP address which will serve as API Server)
+# Set the DNS local Kubernetes
+
+# Remove temporary files
+  - name: "Remove kubeinit.log"
+    shell: |
+      rm -rvf kubeinit.log
+    register: shell_output
+  - debug: var=shell_output
+
+# Register deployment variables
+  - name: "K8S Init variables"
+    set_fact:
+      svcCIDR: "172.200.10.0/24"
+      podCIDR: "10.168.0.0/16"
+      advIP: "192.18.1.21"
+      svcDNS: "kube.local"
+
+# Kubeadm bootstrap init
+  - name: "Kubeadm Bootstrap"
+    shell: |
+      kubeadm init --service-cidr={{ svcCIDR }} --pod-network-cidr={{ podCIDR }} --apiserver-advertise-address={{ advIP }} --service-dns-domain {{ svcDNS }} &> kubeinit.log
+    register: shell_output
+  - debug: var=shell_output
+
+# Kubernetes Set Environment Variable
+  - name: "Set K8S env variable"
+    shell: |
+      mkdir -p $HOME/.kube
+      cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+      chown $(id -u):$(id -g) $HOME/.kube/config
+    register: shell_output
+  - debug: var=shell_output
+
+# Deploy CNI
+# In this example using Calico as CNI
+  - name: "Calico deployment"
+    shell: |
+      curl https://docs.projectcalico.org/manifests/calico.yaml -O
+      kubectl apply -f calico.yaml
+      curl -o calicoctl -O -L  "https://github.com/projectcalico/calicoctl/releases/download/v3.21.2/calicoctl"
+      chmod +x calicoctl
+      mv calicoctl /usr/bin
+    register: shell_output
+  - debug: var=shell_output
+
+# Create join script
+  - name: "Create join script"
+    shell: |
+      touch kubejoin.sh
+      tail -n2 kubeinit.log &> kubejoin.sh
+      chmod 777 kubejoin.sh
+      scp kubejoin.sh root@centos-k8s-wrk01:/root
+      scp kubejoin.sh root@centos-k8s-wrk02:/root
+    register: shell_output
+  - debug: var=shell_output
